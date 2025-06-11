@@ -7,11 +7,11 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.LinkedList;
 import java.util.List;
-import java.util.Map;
-import java.util.Queue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class Coordinator {
     /** Список входных файлов. */
@@ -19,113 +19,93 @@ public class Coordinator {
     /** Количество reduce-задач. */
     private final int nReduce;
     /** Очередь для задач map, которые нужно обработать. */
-    private final Queue<Integer> mapTasks;
+    private final BlockingQueue<Task> mapTasks;
     /** Очередь для задач reduce, которые нужно обработать. */
-    private final Queue<Integer> reduceTasks;
-    /** Мапа со статусами map задач. */
-    private final Map<Integer, Boolean> mapTaskStatus;
-    /** Мапа со статусами reduce задач. */
-    private final Map<Integer, Boolean> reduceTaskStatus;
+    private final BlockingQueue<Task> reduceTasks;
     /** Мапа - хранит id map задачи : список файлов где хранятся промежуточные файлы. */
-    private final Map<Integer, List<String>> mapTaskOutputs;
-    /** Флаг, что все задачи map выполнены. */
-    private boolean allMapDone;
-    /** Флаг, что все задачи reduce выполнены. */
-    private boolean allReduceDone;
+    private final ConcurrentHashMap<Integer, List<String>> mapTaskOutputs;
     /** Флаг записи результата */
-    private boolean outputFileExists;
+    private volatile boolean outputFileExists;
+    /** Счетчик завершенных reduce задач */
+    private final AtomicInteger completedReduceTasks;
+    /** Флаг проверки, что reduce задачи инициализированы */
+    private volatile boolean reducePhaseInitialized = false;
 
     private static final Logger logger = LoggerFactory.getLogger(Coordinator.class);
 
-    static {
-        try {
-            MapReduce.clearTmpAndOutputDirectories();
-        } catch (IOException e) {
-            logger.error("Ошибка при очистке директорий");
-            throw new RuntimeException(e);
-        }
-    }
 
     public Coordinator(List<String> inputFiles, int nReduce) {
         this.inputFiles = inputFiles;
         this.nReduce = nReduce;
-        this.mapTasks = new LinkedList<>();
-        this.reduceTasks = new LinkedList<>();
-        this.mapTaskStatus = new HashMap<>();
-        this.reduceTaskStatus = new HashMap<>();
-        this.mapTaskOutputs = new HashMap<>();
-        this.allMapDone = false;
-        this.allReduceDone = false;
-        this.outputFileExists = false;
+        this.mapTasks = new LinkedBlockingQueue<>();
+        this.reduceTasks = new LinkedBlockingQueue<>();
+        this.mapTaskOutputs = new ConcurrentHashMap<>();
+        this.completedReduceTasks = new AtomicInteger(0);
 
         // Инициализация задач Map
         for (int i = 0; i < inputFiles.size(); i++) {
-            mapTasks.add(i);
-            mapTaskStatus.put(i, false);
+            mapTasks.add(new Task(TaskType.MAP, i, inputFiles.get(i), null));
         }
-
-        // Инициализация задач Reduce
-        for (int i = 0; i < nReduce; i++) {
-            reduceTasks.add(i);
-            reduceTaskStatus.put(i, false);
-        }
+        mapTasks.add(new Task(TaskType.DONE, -1, null, null));
     }
 
     public synchronized Task getTask() throws InterruptedException, IOException {
         // Сначала раздаем задачи Map
-        if (!mapTasks.isEmpty() && !allMapDone) {
-            int taskId = mapTasks.poll();
-            return new Task(TaskType.MAP, taskId, inputFiles.get(taskId), null);
-        }
-
-        // Если все задачи Map назначены, но не завершены - ждем
-        if (!allMapDone) {
-            boolean allDone = mapTaskStatus.values().stream().allMatch(done -> done);
-            if (allDone) {
-                allMapDone = true;
-                notifyAll();
-            } else {
-                wait();
-                return getTask();
-            }
+        Task mapTask = mapTasks.peek();
+        if (mapTask != null && mapTask.type != TaskType.DONE) {
+            return mapTasks.poll();
         }
 
         // Затем раздаем задачи Reduce
-        if (!reduceTasks.isEmpty()) {
-            int reduceId = reduceTasks.poll();
-            // Собираем промежуточные файлы для этой задачи Reduce
-            List<String> files = new ArrayList<>();
-            for (int mapId : mapTaskOutputs.keySet()) {
-                files.add("mr-" + mapId + "-" + reduceId);
-            }
-            return new Task(TaskType.REDUCE, reduceId, null, files);
-        }
-
-        // Проверяем завершение всех задач Reduce
-        boolean allDone = reduceTaskStatus.values().stream().allMatch(done -> done);
-        if (allDone) {
-            allReduceDone = true;
-            notifyAll();
-            if (!outputFileExists) {
-                MapReduce.mergeReduceOutputs(nReduce);
-                outputFileExists = true;
-            }
+        Task reduceTask = reduceTasks.peek();
+        if (reduceTask != null && reduceTask.type != TaskType.DONE) {
+            return reduceTasks.poll();
         }
         return new Task(TaskType.DONE, -1, null, null);
     }
 
     public synchronized void completeMapTask(int taskId, List<String> outputs) {
-        mapTaskStatus.put(taskId, true);
         mapTaskOutputs.put(taskId, outputs);
-        notifyAll();
+        if (!reducePhaseInitialized && mapTasks.size() == 1) {
+            initReduceTasks();
+            reducePhaseInitialized = true;
+        }
     }
 
-    public synchronized void completeReduceTask(int taskId) {
-        reduceTaskStatus.put(taskId, true);
-        notifyAll();
+    public void completeReduceTask() {
+        int completed = completedReduceTasks.incrementAndGet(); // Увеличиваем счетчик
+        if (completed == nReduce && !outputFileExists) {
+            try {
+                MapReduce.mergeReduceOutputs(nReduce);
+                outputFileExists = true;
+            } catch (IOException e) {
+                logger.error("Ошибка при объединении результатов", e);
+            }
+        }
     }
 
     public synchronized boolean isDone() {
-        return allReduceDone;
+        return mapTasks.peek() != null && mapTasks.peek().type == TaskType.DONE
+                && completedReduceTasks.get() == nReduce
+                && outputFileExists;
+    }
+
+    private void initReduceTasks() {
+        for (int reduceId = 0; reduceId < nReduce; reduceId++) {
+            List<String> files = new ArrayList<>();
+            for (int mapId : mapTaskOutputs.keySet()) {
+                files.add("mr-" + mapId + "-" + reduceId);
+            }
+            reduceTasks.add(new Task(TaskType.REDUCE, reduceId, null, files));
+        }
+        reduceTasks.add(new Task(TaskType.DONE, -1, null, null));
+    }
+
+    public void returnMapTaskBack(Task task) {
+        mapTasks.add(task);
+    }
+
+    public void returnReduceTaskBack(Task task) {
+        reduceTasks.add(task);
     }
 }

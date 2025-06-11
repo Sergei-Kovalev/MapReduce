@@ -1,6 +1,7 @@
 package jdev.kovalev;
 
 import jdev.kovalev.dto.KeyValue;
+import jdev.kovalev.util.PathManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -22,9 +23,6 @@ import java.util.TreeMap;
 import java.util.stream.Collectors;
 
 public class MapReduce {
-    private static final String TMP_DIR = "tmp";
-    private static final String OUTPUT_DIR = "output";
-
     private static final Logger logger = LoggerFactory.getLogger(MapReduce.class);
     public static final String FINAL_FILE_NAME = "mr-out-final.txt";
 
@@ -47,7 +45,7 @@ public class MapReduce {
         Map<String, String> finalResult = new TreeMap<>();
 
         for (int i = 0; i < nReduce; i++) {
-            Path filePath = Paths.get(OUTPUT_DIR, "mr-out-" + i);
+            Path filePath = PathManager.getOutputPath("mr-out-" + i);
             if (Files.exists(filePath)) {
                 readReduceFile(finalResult, filePath);
             }
@@ -58,10 +56,10 @@ public class MapReduce {
 
     // Функция очистки директорий output и tmp
     public static void clearTmpAndOutputDirectories() throws IOException {
-        deleteDirectory(TMP_DIR);
-        deleteDirectory(OUTPUT_DIR);
-        Files.createDirectories(Paths.get(TMP_DIR));
-        Files.createDirectories(Paths.get(OUTPUT_DIR));
+        deleteDirectory(PathManager.getTmpDir());
+        deleteDirectory(PathManager.getOutputDir());
+        Files.createDirectories(PathManager.getTmpPath());
+        Files.createDirectories(PathManager.getOutputPath());
     }
 
     private static void readReduceFile(Map<String, String> finalResult, Path filePath) throws IOException {
@@ -78,14 +76,14 @@ public class MapReduce {
     }
 
     private static void createOutputFile(Map<String, String> finalResult) throws IOException {
-        Files.createDirectories(Paths.get(OUTPUT_DIR));
-        String outFile = Paths.get(OUTPUT_DIR, FINAL_FILE_NAME).toString();
-        try (PrintWriter writer = new PrintWriter(new FileWriter(outFile))) {
+        Files.createDirectories(PathManager.getOutputPath());
+        Path outFile = PathManager.getOutputPath(FINAL_FILE_NAME);
+        try (PrintWriter writer = new PrintWriter(new FileWriter(outFile.toFile()))) {
             for (Map.Entry<String, String> entry : finalResult.entrySet()) {
                 writer.println(entry.getKey() + " " + entry.getValue());
             }
         }
-        logger.info("Результат записан в директорию {}. Название файла - {}", OUTPUT_DIR, FINAL_FILE_NAME);
+        logger.info("Результат записан в директорию {}. Название файла - {}", outFile, FINAL_FILE_NAME);
     }
 
     private static void deleteDirectory(String directoryName) throws IOException {

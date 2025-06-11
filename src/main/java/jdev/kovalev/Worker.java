@@ -2,6 +2,7 @@ package jdev.kovalev;
 
 import jdev.kovalev.dto.KeyValue;
 import jdev.kovalev.task.Task;
+import jdev.kovalev.util.PathManager;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -14,7 +15,6 @@ import java.io.ObjectOutputStream;
 import java.io.PrintWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -25,10 +25,6 @@ import java.util.Map;
 public class Worker implements Runnable {
     private final Coordinator coordinator;
     private final int nReduce;
-
-    private static final String INPUT_DIR = "input";
-    private static final String TMP_DIR = "tmp";
-    private static final String OUTPUT_DIR = "output";
 
     private static final Logger logger = LoggerFactory.getLogger(Worker.class);
 
@@ -69,7 +65,7 @@ public class Worker implements Runnable {
     private void handleMapTask(Task task) {
         try {
             // Чтение содержимого файла
-            Path inputPath = Paths.get(INPUT_DIR, task.filename);
+            Path inputPath = PathManager.getInputPath(task.filename);
             String content = Files.readString(inputPath);
             logger.info("Читаю содержимое файла {}", task.filename);
 
@@ -89,7 +85,7 @@ public class Worker implements Runnable {
             // Запись разделенных данных в файлы
             for (Map.Entry<Integer, List<KeyValue>> entry : partitions.entrySet()) {
                 int reduceId = entry.getKey();
-                String filename = Paths.get(TMP_DIR, "mr-" + task.id + "-" + reduceId).toString();
+                String filename = PathManager.getTmpPath("mr-" + task.id + "-" + reduceId).toString();
 
                 try (ObjectOutputStream out = new ObjectOutputStream(new FileOutputStream(filename))) {
                     out.writeObject(entry.getValue());
@@ -100,6 +96,7 @@ public class Worker implements Runnable {
             coordinator.completeMapTask(task.id, outputFiles);
         } catch (IOException e) {
             logger.error("Ошибка при создании временных файлов");
+            coordinator.returnMapTaskBack(task);
         }
     }
 
@@ -108,7 +105,7 @@ public class Worker implements Runnable {
             // Чтение всех промежуточных файлов для этой задачи Reduce
             List<KeyValue> kvs = new ArrayList<>();
             for (String file : task.intermediateFiles) {
-                Path filePath = Paths.get(TMP_DIR, file);
+                Path filePath = PathManager.getTmpPath(file);
                 try (ObjectInputStream in = new ObjectInputStream(new FileInputStream(filePath.toFile()))) {
                     @SuppressWarnings("unchecked")
                     List<KeyValue> fileKvs = (List<KeyValue>) in.readObject();
@@ -129,7 +126,7 @@ public class Worker implements Runnable {
             }
 
             // Запись результата в файл
-            String outFile = Paths.get(OUTPUT_DIR, "mr-out-" + task.id).toString();
+            String outFile = PathManager.getOutputPath("mr-out-" + task.id).toString();
             try (PrintWriter writer = new PrintWriter(outFile)) {
                 for (Map.Entry<String, List<String>> entry : grouped.entrySet()) {
                     String result = MapReduce.reduce(entry.getKey(), entry.getValue());
@@ -138,9 +135,10 @@ public class Worker implements Runnable {
             }
             logger.info("Создаю промежуточный файл для последующего объединения {}", outFile);
 
-            coordinator.completeReduceTask(task.id);
+            coordinator.completeReduceTask();
         } catch (IOException e) {
             logger.error("Ошибка записи файла");
+            coordinator.returnReduceTaskBack(task);
         }
     }
 }
